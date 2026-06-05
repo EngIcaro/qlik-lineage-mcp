@@ -1,0 +1,38 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+.idea/
+
+# Claude Code local settings
+.claude/
+
+# MCP local config (machine-specific paths — use .mcp.json.example as reference)
+.mcp.json
+
+# API fixtures captured from real tenants — contain tenant-specific names/IDs
+tests/fixtures/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "qlik-lineage": {
+      "type": "stdio",
+      "command": "/absolute/path/to/your/.venv/bin/qlik-lineage-mcp",
+      "args": []
+    }
+  }
+}
