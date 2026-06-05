@@ -17,6 +17,7 @@ of apps in a tenant).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, AsyncIterator, Optional
@@ -295,7 +296,17 @@ class QlikClient:
         while url:
             resp = await self._get_with_retry(url, params=current_params)
             resp.raise_for_status()
-            payload = resp.json()
+            if not resp.content or not resp.content.strip():
+                logger.debug("Empty body from %s — stopping pagination", url)
+                break
+            try:
+                payload = resp.json()
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Non-JSON response from %s (status=%s, body=%r) — stopping pagination",
+                    url, resp.status_code, resp.content[:200],
+                )
+                break
             for item in payload.get("data", []) or []:
                 yield item
             next_href = (
@@ -422,7 +433,16 @@ class QlikClient:
         """Return the raw ``/api/v1/apps/{appId}/data/metadata`` payload."""
         resp = await self._get_with_retry(f"/api/v1/apps/{app_id}/data/metadata")
         resp.raise_for_status()
-        return resp.json()
+        if not resp.content or not resp.content.strip():
+            return {}
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            logger.warning(
+                "Non-JSON metadata response for app %s (status=%s, body=%r)",
+                app_id, resp.status_code, resp.content[:200],
+            )
+            return {}
 
     async def get_app_fields(
         self,
@@ -452,7 +472,16 @@ class QlikClient:
         """
         resp = await self._get_with_retry(f"/api/v1/apps/{app_id}/data/lineage")
         resp.raise_for_status()
-        payload = resp.json()
+        if not resp.content or not resp.content.strip():
+            return []
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError:
+            logger.warning(
+                "Non-JSON lineage response for app %s (status=%s, body=%r)",
+                app_id, resp.status_code, resp.content[:200],
+            )
+            return []
         if not isinstance(payload, list):
             return []
         return [LineageEntry.model_validate(x) for x in payload]
