@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import quote, urlparse
 
@@ -62,6 +63,17 @@ def parse_app(raw: dict[str, Any]) -> App:
     attrs = raw.get("resourceAttributes") or {}
     resource_id = raw.get("resourceId") or attrs.get("id", "")
     size = raw.get("resourceSize") or {}
+
+    last_reload_time: Optional[datetime] = None
+    raw_reload = attrs.get("lastReloadTime")
+    if raw_reload:
+        try:
+            last_reload_time = datetime.fromisoformat(
+                raw_reload.replace("Z", "+00:00")
+            )
+        except ValueError:
+            logger.debug("Could not parse lastReloadTime %r for app %s", raw_reload, resource_id)
+
     return App(
         id=resource_id,
         name=raw.get("name", ""),
@@ -69,6 +81,7 @@ def parse_app(raw: dict[str, Any]) -> App:
         app_file_size=int(size.get("appFile") or 0),
         app_memory_size=int(size.get("appMemory") or 0),
         usage=attrs.get("usage"),
+        last_reload_time=last_reload_time,
     )
 
 

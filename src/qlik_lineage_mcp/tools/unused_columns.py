@@ -36,6 +36,7 @@ treat the verdict as conditional on those apps.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 from ..config import load_settings
@@ -101,12 +102,39 @@ def _extract_renames_from_consumer_graph(
 # Core analysis — pure async function. Tests pass a FakeQlikClient.
 # ---------------------------------------------------------------------------
 
+def _parse_activation_date(raw: Optional[str]) -> Optional[datetime]:
+    """Parse a user-supplied ISO date/datetime string to a UTC-aware datetime.
+
+    Accepts ``"2025-06-01"``, ``"2025-06-01T00:00:00"`` and
+    ``"2025-06-01T00:00:00Z"`` (and full offset forms). Returns ``None``
+    when ``raw`` is empty or unparseable so callers can skip staleness checks
+    gracefully.
+    """
+    if not raw:
+        return None
+    s = raw.strip().replace("Z", "+00:00")
+    # Accept date-only strings by appending midnight UTC.
+    if "T" not in s and len(s) == 10:
+        s += "T00:00:00+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        logger.warning("Could not parse lineage_activation_date %r — staleness check skipped.", raw)
+        return None
+
+
 async def analyze_unused_columns(
     client: QlikClient,
     file_name: str,
     space_name: str,
+    lineage_activation_date: Optional[str] = None,
 ) -> dict:
     """Run the unused-columns analysis and return a JSON-serializable dict."""
+    activation_dt = _parse_activation_date(lineage_activation_date)
+
     # ---- Phase 0: resolve space + target file
     space = await client.find_space_by_name(space_name)
     if space is None:
@@ -185,6 +213,37 @@ async def analyze_unused_columns(
                 consumer_apps.append(app)
                 break
 
+    # ---- Staleness check: split consumers into fresh vs. stale before
+    # pulling field-level lineage. Apps reloaded before lineage was activated
+    # in the tenant have no edges in their graph — fetching them wastes a
+    # network call and produces misleading "no renames found" signals.
+    stale_consumer_apps: list[dict] = []
+    fresh_consumer_apps: list[App] = []
+    for app in consumer_apps:
+        if (
+            activation_dt is not None
+            and app.last_reload_time is not None
+            and app.last_reload_time < activation_dt
+        ):
+            stale_consumer_apps.append({
+                "app_id": app.id,
+                "app_name": app.name,
+                "last_reload_time": app.last_reload_time.isoformat(),
+                "note": (
+                    f"Last reloaded {app.last_reload_time.date()} — before lineage "
+                    f"activation ({activation_dt.date()}). Field-level lineage will "
+                    "be empty; renames in this app are not detectable until it is reloaded."
+                ),
+            })
+        else:
+            fresh_consumer_apps.append(app)
+
+    if stale_consumer_apps:
+        logger.info(
+            "%d of %d consumer apps are stale (reloaded before %s) — skipping their field-level lineage.",
+            len(stale_consumer_apps), len(consumer_apps), activation_dt,
+        )
+
     # ---- Phase 3: for CONSUMERS ONLY, pull (a) metadata for direct
     # field-name evidence and (b) field-level lineage for rename
     # evidence. Both signals are tied to a specific consumer app so the
@@ -196,7 +255,7 @@ async def analyze_unused_columns(
     consumer_metadata_count = 0
     consumer_lineage_count = 0
 
-    for app in consumer_apps:
+    for app in fresh_consumer_apps:
         # Metadata of this consumer.
         consumer_field_set: set[str] = set()
         try:
@@ -274,6 +333,7 @@ async def analyze_unused_columns(
     # ---- Phase 5: response
     parquet_warning = target.format == FileFormat.PARQUET
     has_lineage_failures = bool(consumer_lineage_failures)
+    has_stale = bool(stale_consumer_apps)
 
     return {
         "file": {
@@ -290,6 +350,7 @@ async def analyze_unused_columns(
             "unused_count": len(unused),
             "apps_scanned": len(apps),
             "consumer_apps_found": len(consumer_apps),
+            "stale_consumer_apps_skipped": len(stale_consumer_apps),
             "consumer_metadata_extracted": consumer_metadata_count,
             "consumer_lineage_extracted": consumer_lineage_count,
         },
@@ -300,10 +361,14 @@ async def analyze_unused_columns(
         "metadata_unavailable_apps": metadata_failures,
         "lineage_unavailable_apps": lineage_failures,
         "consumer_lineage_failures": consumer_lineage_failures,
+        # Apps confirmed as consumers but skipped because their last reload
+        # predates lineage activation — their renames are invisible.
+        "stale_consumer_apps": stale_consumer_apps,
         "disclaimers": _disclaimers(
             parquet_warning,
             bool(metadata_failures),
             has_lineage_failures,
+            has_stale,
         ),
         # Per safety rule: never recommend removing a column whose status
         # is conditional on apps we could not inspect.
@@ -312,6 +377,7 @@ async def analyze_unused_columns(
             "conditional_on_apps_we_could_not_inspect": (
                 [a["app_id"] for a in metadata_failures]
                 + [a["app_id"] for a in consumer_lineage_failures]
+                + [a["app_id"] for a in stale_consumer_apps]
             ),
         },
     }
@@ -321,6 +387,7 @@ def _disclaimers(
     parquet_warning: bool,
     has_metadata_failures: bool,
     has_consumer_lineage_failures: bool,
+    has_stale_consumers: bool = False,
 ) -> list[str]:
     """Disclaimers always attached to the response.
 
@@ -353,6 +420,13 @@ def _disclaimers(
             "(see consumer_lineage_failures). Renames in those apps are not "
             "represented in the result."
         )
+    if has_stale_consumers:
+        items.append(
+            "Some consumer apps were reloaded before field-level lineage was "
+            "activated (see stale_consumer_apps). Renames in those apps are "
+            "not detectable until they are reloaded. Their columns may appear "
+            "in 'unused' even if actively used under a different name."
+        )
     if parquet_warning:
         items.append(
             "Parquet support is pending real API-shape confirmation; "
@@ -378,7 +452,11 @@ def register(mcp: "FastMCP") -> None:
     """Register the ``unused_columns`` tool with the FastMCP server."""
 
     @mcp.tool()
-    async def unused_columns(file_name: str, space_name: str) -> dict:
+    async def unused_columns(
+        file_name: str,
+        space_name: str,
+        lineage_activation_date: Optional[str] = None,
+    ) -> dict:
         """Return columns of a data file that no app in the tenant consumes.
 
         Args:
@@ -386,10 +464,17 @@ def register(mcp: "FastMCP") -> None:
                        Case-insensitive but extension must match.
             space_name: Display name of the space the file lives in.
                         Case-insensitive.
+            lineage_activation_date: ISO 8601 date when field-level lineage
+                was activated in the tenant (e.g. ``"2025-06-01"``). Consumer
+                apps last reloaded before this date have no edges in their
+                lineage graph and are marked as stale instead of being queried.
+                Omit to skip staleness detection.
         """
         settings = load_settings()
         async with QlikClient(settings) as client:
-            return await analyze_unused_columns(client, file_name, space_name)
+            return await analyze_unused_columns(
+                client, file_name, space_name, lineage_activation_date
+            )
 
 
 # Built: 3-phase ``unused_columns`` — file-side enumeration via field-level

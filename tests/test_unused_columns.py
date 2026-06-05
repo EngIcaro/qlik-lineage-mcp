@@ -7,6 +7,8 @@ and one integration test against a captured field-level lineage fixture
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from qlik_lineage_mcp.models import (
@@ -23,6 +25,7 @@ from qlik_lineage_mcp.models import (
 from qlik_lineage_mcp.tools.unused_columns import (
     _columns_from_field_graph,
     _extract_renames_from_consumer_graph,
+    _parse_activation_date,
     analyze_unused_columns,
 )
 
@@ -435,3 +438,163 @@ async def test_integration_fixture_field_lineage(fake_client: FakeQlikClient):
     assert "A1_PESSOA" not in result["unused_columns"]
     assert "A1_SUFRAMA" in result["unused_columns"]
     assert "A1_DTCAD" in result["unused_columns"]
+
+
+# ---------------------------------------------------------------------------
+# Staleness detection
+# ---------------------------------------------------------------------------
+
+_ACT = datetime(2025, 6, 1, tzinfo=timezone.utc)   # lineage activation date
+_BEFORE = datetime(2025, 5, 1, tzinfo=timezone.utc) # reloaded before activation → stale
+_AFTER  = datetime(2025, 7, 1, tzinfo=timezone.utc) # reloaded after  activation → fresh
+
+
+class TestParseActivationDate:
+    def test_date_only_string(self):
+        dt = _parse_activation_date("2025-06-01")
+        assert dt == datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+    def test_datetime_with_z(self):
+        dt = _parse_activation_date("2025-06-01T10:30:00Z")
+        assert dt is not None
+        assert dt.year == 2025 and dt.month == 6 and dt.day == 1
+
+    def test_datetime_with_offset(self):
+        dt = _parse_activation_date("2025-06-01T00:00:00+00:00")
+        assert dt == datetime(2025, 6, 1, tzinfo=timezone.utc)
+
+    def test_none_returns_none(self):
+        assert _parse_activation_date(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_activation_date("") is None
+
+    def test_invalid_string_returns_none(self):
+        assert _parse_activation_date("not-a-date") is None
+
+
+async def test_stale_consumer_is_skipped_and_surfaced(fake_client: FakeQlikClient):
+    """A consumer reloaded before lineage activation must appear in
+    stale_consumer_apps and must NOT trigger a field-level lineage call
+    (FakeQlikClient raises for unknown graphs — if it were called, the test
+    would error)."""
+    target = _setup_file(fake_client, ["ColA", "ColB"])
+    stale_app = App(id="STALE", name="Old App", usage="ANALYTICS", last_reload_time=_BEFORE)
+    fake_client.apps_in_tenant = [stale_app]
+    fake_client.app_fields = {"STALE": [AppField(name="ColA")]}
+    fake_client.app_lineage = {
+        "STALE": [LineageEntry(discriminator=f"lib://X:DataFiles/{target.name};")],
+    }
+    # Deliberately do NOT register a consumer lineage graph — if the code
+    # tried to fetch it, FakeQlikClient would raise and the test would fail.
+
+    result = await analyze_unused_columns(
+        fake_client, target.name, "Finance",
+        lineage_activation_date="2025-06-01",
+    )
+
+    assert result["summary"]["consumer_apps_found"] == 1
+    assert result["summary"]["stale_consumer_apps_skipped"] == 1
+    assert result["summary"]["consumer_lineage_extracted"] == 0
+    stale = result["stale_consumer_apps"]
+    assert len(stale) == 1
+    assert stale[0]["app_id"] == "STALE"
+    assert "2025-05-01" in stale[0]["last_reload_time"]
+    assert "STALE" in result["recommendation"]["conditional_on_apps_we_could_not_inspect"]
+    assert any("stale_consumer_apps" in d for d in result["disclaimers"])
+
+
+async def test_fresh_consumer_processed_normally(fake_client: FakeQlikClient):
+    """A consumer reloaded AFTER activation is treated as fresh — its
+    field-level lineage is queried and renames are detected."""
+    target = _setup_file(fake_client, ["ColA", "ColB"])
+    fresh_app = App(id="FRESH", name="New App", usage="ANALYTICS", last_reload_time=_AFTER)
+    fake_client.apps_in_tenant = [fresh_app]
+    fake_client.app_fields = {"FRESH": []}
+    fake_client.app_lineage = {
+        "FRESH": [LineageEntry(discriminator=f"lib://X:DataFiles/{target.name};")],
+    }
+    app_qri = "qri:app:sense://FRESH"
+    consumer_graph = LineageGraph(
+        graph_type="FIELD",
+        nodes=[
+            LineageNode(qri=f"{FILE_QRI}#t#0", label="ColA", type="FIELD"),
+            LineageNode(qri=f"{app_qri}#x#0", label="alias_a", type="FIELD"),
+        ],
+        edges=[
+            LineageEdge(relation="from", source=f"{FILE_QRI}#t#0", target=f"{app_qri}#x#0"),
+        ],
+    )
+    fake_client.lineage_graphs[(app_qri, "field")] = consumer_graph
+
+    result = await analyze_unused_columns(
+        fake_client, target.name, "Finance",
+        lineage_activation_date="2025-06-01",
+    )
+
+    assert result["summary"]["stale_consumer_apps_skipped"] == 0
+    assert result["stale_consumer_apps"] == []
+    assert result["summary"]["consumer_lineage_extracted"] == 1
+    renamed_cols = {u["column"] for u in result["used_with_rename"]}
+    assert "ColA" in renamed_cols
+    assert result["unused_columns"] == ["ColB"]
+
+
+async def test_mixed_stale_and_fresh_consumers(fake_client: FakeQlikClient):
+    """With two consumers — one stale, one fresh — the stale one is skipped
+    and the fresh one provides rename evidence. The stale app appears in
+    conditional_on_apps_we_could_not_inspect."""
+    target = _setup_file(fake_client, ["ColA", "ColB", "ColC"])
+    stale = App(id="STALE", name="Old App", usage="ANALYTICS", last_reload_time=_BEFORE)
+    fresh = App(id="FRESH", name="New App", usage="ANALYTICS", last_reload_time=_AFTER)
+    fake_client.apps_in_tenant = [stale, fresh]
+    fake_client.app_fields = {
+        "STALE": [AppField(name="ColA")],
+        "FRESH": [AppField(name="ColB")],
+    }
+    entry = [LineageEntry(discriminator=f"lib://X:DataFiles/{target.name};")]
+    fake_client.app_lineage = {"STALE": entry, "FRESH": entry}
+
+    fresh_qri = "qri:app:sense://FRESH"
+    fake_client.lineage_graphs[(fresh_qri, "field")] = LineageGraph(
+        graph_type="FIELD", nodes=[], edges=[]
+    )
+
+    result = await analyze_unused_columns(
+        fake_client, target.name, "Finance",
+        lineage_activation_date="2025-06-01",
+    )
+
+    assert result["summary"]["stale_consumer_apps_skipped"] == 1
+    assert result["summary"]["consumer_lineage_extracted"] == 1
+    stale_ids = {a["app_id"] for a in result["stale_consumer_apps"]}
+    assert stale_ids == {"STALE"}
+    # ColB matched FRESH's metadata directly; ColA matched STALE (direct,
+    # metadata is still checked for stale apps? No — stale apps skip
+    # field-level lineage only. Direct metadata is NOT collected for stale
+    # apps because we skip them in the fresh_consumer_apps loop.
+    # ColC has no evidence from either consumer.
+    assert "STALE" in result["recommendation"]["conditional_on_apps_we_could_not_inspect"]
+
+
+async def test_no_activation_date_skips_staleness_check(fake_client: FakeQlikClient):
+    """Without lineage_activation_date, stale detection is disabled — all
+    consumer apps are processed regardless of last_reload_time."""
+    target = _setup_file(fake_client, ["ColA"])
+    app = App(id="OLD", name="Old App", usage="ANALYTICS", last_reload_time=_BEFORE)
+    fake_client.apps_in_tenant = [app]
+    fake_client.app_fields = {"OLD": [AppField(name="ColA")]}
+    fake_client.app_lineage = {
+        "OLD": [LineageEntry(discriminator=f"lib://X:DataFiles/{target.name};")],
+    }
+    app_qri = "qri:app:sense://OLD"
+    fake_client.lineage_graphs[(app_qri, "field")] = LineageGraph(
+        graph_type="FIELD", nodes=[], edges=[]
+    )
+
+    # No lineage_activation_date → backward-compatible, no stale detection.
+    result = await analyze_unused_columns(fake_client, target.name, "Finance")
+
+    assert result["summary"]["stale_consumer_apps_skipped"] == 0
+    assert result["stale_consumer_apps"] == []
+    assert result["summary"]["consumer_lineage_extracted"] == 1

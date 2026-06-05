@@ -11,6 +11,7 @@ Design intent:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -61,6 +62,10 @@ class App(BaseModel):
     # Drives ``lineage_qri`` below because the Qlik lineage namespace uses
     # different prefixes for the two app types.
     usage: Optional[str] = None
+    # Timestamp of the most recent successful reload. Used for staleness
+    # detection: apps reloaded before field-level lineage was activated in the
+    # tenant have no edges in their lineage graph and renames are invisible.
+    last_reload_time: Optional[datetime] = None
 
     @property
     def lineage_qri(self) -> str:
