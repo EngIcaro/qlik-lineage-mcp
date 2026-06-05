@@ -13,7 +13,7 @@ Um servidor MCP **read-only** que expõe duas análises de lineage para tenants 
 | `ghost_files` | Quais data files de um espaço não são consumidos por nenhum app do tenant? (incluindo cadeias arquivo→app→arquivo) |
 | `unused_columns` | Quais colunas de um data file não são consumidas por nenhum app do tenant? |
 
-Tudo escrito em Python 3.10+, framework `FastMCP` (do SDK oficial `mcp`), `httpx` async, Pydantic, transporte stdio local. 40 testes passando contra fixtures reais capturadas via Postman.
+Tudo escrito em Python 3.10+, framework `FastMCP` (do SDK oficial `mcp`), `httpx` async, Pydantic, transporte stdio local. 48 testes passando contra fixtures reais capturadas via Postman.
 
 ---
 
@@ -63,12 +63,17 @@ Quando você pede `/nodes/{app_qri}?level=field`, o grafo traz **transitivamente
 
 Relations vistas em produção: `from`, `read`, `rename`, `modify`, `add`. Aceitamos qualquer uma como evidência.
 
-### 3.4 Rate limit (HTTP 429)
+### 3.4 Guard contra respostas vazias / non-JSON
+Algumas chamadas ao Qlik Cloud retornam corpo vazio ou texto HTML (normalmente em erros de proxy) em vez de JSON. Isso causava `JSONDecodeError` não tratado que abortava toda a análise.
+
+Solução: `_paginate`, `get_app_metadata` e `get_app_lineage` verificam `resp.content` antes de chamar `.json()`. Respostas vazias retornam `[]` / `{}` silenciosamente com log `DEBUG`; respostas non-JSON logam `WARNING` com os primeiros 200 bytes do corpo e retornam o mesmo default seguro.
+
+### 3.5 Rate limit (HTTP 429)
 Tenants grandes rate-limitam rajadas. Em um QVD com dezenas de consumers, várias chamadas field-level lineage podem falhar com 429.
 
 Solução: `_get_with_retry` em `QlikClient` que honra `Retry-After` quando vem, senão faz backoff exponencial (cap 30s, 5 retries). Todas as chamadas GET passam por ele.
 
-### 3.5 Match direto precisa ser **scoped a consumers** (o bug mais sutil)
+### 3.6 Match direto precisa ser **scoped a consumers** (o bug mais sutil)
 Versão errada do `unused_columns` montava `direct_used = união dos campos de todos os apps do tenant`. Resultado contra um QVD real com 299 colunas: todas marcadas como usadas, zero unused. **Falso positivo enorme** — campos comuns aparecem em apps de teste, backups, demos e outros QVDs com nomes parecidos.
 
 Versão correta: match direto **só conta** se a coluna aparece no metadata de algum dos **consumers identificados via `data/lineage`**. Após o fix, o mesmo QVD mostrou 26 used direct, 2 used_with_rename, **271 unused** — bate com a expectativa do desenvolvedor que conhece o arquivo (QVDs de camada bronze costumam ter muitos campos template que ninguém usa de fato).
@@ -121,6 +126,8 @@ Phase 5: response com sumário, listas com evidência, disclaimers
 **Custo**: 1 + N + 2M chamadas (1 lineage do arquivo, N data/lineage de cada app, 2 chamadas por consumer M).
 Em tenants com 2000 apps e 30 consumers: ~2061 chamadas. O retry de 429 mantém o sucesso ≈100%.
 
+**Com cache ativo** (mesma sessão Claude, tools chamadas em sequência): N data/lineage de cada app são servidos do cache — reduz para 1 + 2M chamadas na segunda tool.
+
 ---
 
 ## 5. Estrutura modular (extensibilidade)
@@ -130,6 +137,7 @@ src/qlik_lineage_mcp/
 ├── server.py           # FastMCP entry point — chama register_all
 ├── config.py           # Settings (lê .env)
 ├── qlik_client.py      # ÚNICA camada HTTP; parsers + classify_discriminator
+├── session_cache.py    # Singleton TTL cache (5 min) compartilhado entre tools
 ├── models.py           # Pydantic format-agnostic (DataFile = QVD ou Parquet)
 └── tools/
     ├── __init__.py     # auto-registra todo módulo que exporta register(mcp)
@@ -138,6 +146,14 @@ src/qlik_lineage_mcp/
 ```
 
 **Adicionar uma análise nova = criar 1 arquivo em `tools/` com `register(mcp)`.** O `server.py` nunca precisa ser tocado.
+
+### Cache de sessão
+
+`session_cache.py` expõe um singleton `_cache` (`SessionCache`, TTL=300s) que persiste entre instâncias de `QlikClient` dentro do mesmo processo. Cada tool cria um novo `QlikClient` por invocação; o cache garante que a listagem de apps e os `N` data/lineage já consultados por `ghost_files` não sejam repetidos quando `unused_columns` rodar na sequência.
+
+Chave de cache: `(tenant_url, método, *args)` — garante isolamento entre tenants.
+
+Métodos cacheados: `find_space_by_name`, `list_data_files_in_space`, `list_apps_in_tenant`, `get_app_lineage`, `get_lineage_graph`.
 
 ---
 
@@ -163,7 +179,7 @@ O resultado de 271 unused **bateu com a expectativa do desenvolvedor** que conhe
 ### 7.1 Funcionalidades pendentes
 - [x] **Tamanho real em GB**: `list_data_files_in_space` agora roda `/api/v1/items` e `/api/v1/data-files` em paralelo e faz merge por filename em `DataFile.estimated_size_bytes`.
 - [ ] **Suporte Parquet validado**: o modelo é format-agnostic e tem TODO markers no código. Quando aparecer um fixture real (`/items` com Parquet), validar shape e remover os TODOs.
-- [ ] **Cache compartilhado entre tools**: a varredura de `data/lineage` de todos os apps é cara e é feita tanto pelo `ghost_files` quanto pelo `unused_columns`. Cachear por sessão (TTL ~5min) reduz drasticamente o custo de chamar as duas em sequência.
+- [x] **Cache compartilhado entre tools**: `session_cache.py` com singleton TTL=5min. Os 5 métodos caros do `QlikClient` são cacheados por `(tenant, método, *args)`. Testado com 6 casos cobrindo cross-instance hit, expiração e isolamento de tenant.
 - [ ] **Detecção de reload-staleness**: app cujo `lastReloadTime < lineage_activation_date` provavelmente tem lineage de campo vazio. Marcar esses apps como "suspeitos" na resposta antes mesmo de tentar puxar o grafo.
 
 ### 7.2 Novas análises (cada uma = 1 arquivo em `tools/`)
@@ -202,11 +218,13 @@ O resultado de 271 unused **bateu com a expectativa do desenvolvedor** que conhe
 
 | Arquivo | O que tem |
 |---|---|
-| `src/qlik_lineage_mcp/qlik_client.py` | Camada HTTP, parsers, `classify_discriminator`, `_get_with_retry` |
+| `src/qlik_lineage_mcp/qlik_client.py` | Camada HTTP, parsers, `classify_discriminator`, `_get_with_retry`, guard non-JSON |
+| `src/qlik_lineage_mcp/session_cache.py` | Singleton `SessionCache` TTL=5min compartilhado entre tools |
 | `src/qlik_lineage_mcp/models.py` | Pydantic models, `App.lineage_qri`, `FileFormat` enum |
 | `src/qlik_lineage_mcp/tools/unused_columns.py` | Pipeline de 3 fases |
 | `src/qlik_lineage_mcp/tools/ghost_files.py` | Bipartite + fixpoint |
 | `tests/fixtures/*.json` | Respostas reais capturadas via Postman do tenant de teste |
+| `tests/test_session_cache.py` | Testes do cache: cross-instance hit, TTL expiry, isolamento de tenant |
 | `tests/test_unused_columns.py` | Inclui integration test contra fixtures reais de consumer com expressão composta |
 | `.mcp.json` | Configuração local pra Claude Code apontar pro servidor |
 | `guideline-mcp-qlik-data-lineage.md` | Brief original do projeto (em português) |
@@ -214,4 +232,4 @@ O resultado de 271 unused **bateu com a expectativa do desenvolvedor** que conhe
 
 ---
 
-_Última atualização: 2026-06-05._
+_Última atualização: 2026-06-05 — cache de sessão implementado + guard non-JSON._
