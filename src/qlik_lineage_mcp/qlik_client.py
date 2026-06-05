@@ -26,6 +26,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from .config import Settings
+from .session_cache import _cache
 from .models import (
     App,
     AppField,
@@ -217,6 +218,7 @@ class QlikClient:
 
     def __init__(self, settings: Settings, http: Optional[httpx.AsyncClient] = None):
         self._settings = settings
+        self._tenant = str(settings.tenant_url).rstrip("/")
         # Accepting an injected client makes testing trivial — tests can
         # pass an httpx.AsyncClient backed by respx / MockTransport.
         self._client = http or httpx.AsyncClient(
@@ -227,6 +229,10 @@ class QlikClient:
             },
             timeout=settings.request_timeout_s,
         )
+
+    def _ck(self, *parts: Any) -> tuple:
+        """Build a cache key namespaced by tenant URL."""
+        return (self._tenant, *parts)
 
     async def __aenter__(self) -> "QlikClient":
         return self
@@ -348,11 +354,18 @@ class QlikClient:
         (``"Finance"`` vs ``"finance"``).
         """
         target = name.strip().lower()
+        key = self._ck("space", target)
+        hit, cached = _cache.get(key)
+        if hit:
+            return cached
+        result: Optional[Space] = None
         async for raw in self._paginate("/api/v1/spaces"):
             space = parse_space(raw)
             if space.name.lower() == target:
-                return space
-        return None
+                result = space
+                break
+        _cache.set(key, result)
+        return result
 
     # ----- items (apps + data files) ------------------------------------
 
@@ -372,12 +385,17 @@ class QlikClient:
         Used by ``unused_columns`` because "not used" is a tenant-wide
         statement: a column can be used by an app in any space.
         """
+        key = self._ck("apps")
+        hit, cached = _cache.get(key)
+        if hit:
+            return cached
         out: list[App] = []
         async for raw in self._paginate(
             "/api/v1/items",
             params={"resourceType": "app"},
         ):
             out.append(parse_app(raw))
+        _cache.set(key, out)
         return out
 
     async def _fetch_data_file_sizes(self, space_id: str) -> dict[str, int]:
@@ -406,6 +424,11 @@ class QlikClient:
 
         Sizes are merged by lowercased filename.
         """
+        key = self._ck("files", space_id)
+        hit, cached = _cache.get(key)
+        if hit:
+            return cached
+
         async def _collect_items() -> list[dict[str, Any]]:
             return [r async for r in self._paginate(
                 "/api/v1/items",
@@ -425,6 +448,7 @@ class QlikClient:
                 if real_size > 0:
                     df = df.model_copy(update={"estimated_size_bytes": real_size})
                 out.append(df)
+        _cache.set(key, out)
         return out
 
     # ----- apps: metadata / script / lineage ----------------------------
@@ -470,21 +494,30 @@ class QlikClient:
         Each row's ``discriminator`` is a free-form string; the tools layer
         is responsible for parsing the patterns they care about.
         """
+        key = self._ck("lineage", app_id)
+        hit, cached = _cache.get(key)
+        if hit:
+            return cached
         resp = await self._get_with_retry(f"/api/v1/apps/{app_id}/data/lineage")
         resp.raise_for_status()
         if not resp.content or not resp.content.strip():
-            return []
-        try:
-            payload = resp.json()
-        except json.JSONDecodeError:
-            logger.warning(
-                "Non-JSON lineage response for app %s (status=%s, body=%r)",
-                app_id, resp.status_code, resp.content[:200],
-            )
-            return []
-        if not isinstance(payload, list):
-            return []
-        return [LineageEntry.model_validate(x) for x in payload]
+            result: list[LineageEntry] = []
+        else:
+            try:
+                payload = resp.json()
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Non-JSON lineage response for app %s (status=%s, body=%r)",
+                    app_id, resp.status_code, resp.content[:200],
+                )
+                result = []
+            else:
+                result = (
+                    [LineageEntry.model_validate(x) for x in payload]
+                    if isinstance(payload, list) else []
+                )
+        _cache.set(key, result)
+        return result
 
     # ----- lineage graph ------------------------------------------------
 
@@ -501,6 +534,10 @@ class QlikClient:
         The QRI contains ``:``, ``/``, and ``#`` characters that must be
         percent-encoded so they are not interpreted as path separators.
         """
+        key = self._ck("graph", qri, level)
+        hit, cached = _cache.get(key)
+        if hit:
+            return cached
         encoded = quote(qri, safe="")
         params = {"level": "field"} if level == "field" else None
         resp = await self._get_with_retry(
@@ -508,7 +545,9 @@ class QlikClient:
             params=params,
         )
         resp.raise_for_status()
-        return parse_lineage_graph(resp.json())
+        result = parse_lineage_graph(resp.json())
+        _cache.set(key, result)
+        return result
 
 
 # Built: ``qlik_client.py`` exposes pure parsers (testable against fixtures

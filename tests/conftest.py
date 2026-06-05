@@ -15,6 +15,7 @@ from typing import Optional
 
 import pytest
 
+from qlik_lineage_mcp.session_cache import _cache
 from qlik_lineage_mcp.models import (
     App,
     AppField,
@@ -38,6 +39,14 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def load_fixture(name: str) -> dict | list:
     """Read a JSON fixture by filename relative to ``tests/fixtures/``."""
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+@pytest.fixture(autouse=True)
+def clear_session_cache():
+    """Isolate each test from shared cache state."""
+    _cache.clear()
+    yield
+    _cache.clear()
 
 
 @pytest.fixture
